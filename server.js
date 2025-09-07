@@ -5,6 +5,7 @@ const express = require("express");
 const cors = require("cors");
 const stringSimilarity = require("string-similarity");
 const bodyParser = require("body-parser");
+const compression = require("compression"); // ✅ gzip large responses
 const { createClient } = require("@supabase/supabase-js");
 
 const app = express();
@@ -39,6 +40,7 @@ app.use(
 app.options("*", cors());
 app.use(bodyParser.json({ limit: "50mb" }));
 app.use((req, res, next) => (req.method === "OPTIONS" ? res.sendStatus(204) : next()));
+app.use(compression()); // ✅ enable gzip
 
 // ---------- Helpers ----------
 function jsonError(res, status, message, extra = {}) {
@@ -281,7 +283,7 @@ app.post("/songs/bulk", async (req, res) => {
         .insert(chunk.map((c) => c.row))
         .select("song_id, song_name");
 
-      if (error) {
+    if (error) {
         chunk.forEach((c) => {
           results.push({
             index: c.index,
@@ -315,7 +317,6 @@ app.post("/songs/bulk", async (req, res) => {
       failed: results.filter((r) => r.status === "failed").length,
     };
 
-    // If anything failed/invalid/skipped, still return 201 if some created; otherwise 200.
     const status = createdCount > 0 ? 201 : 200;
     return res.status(status).json({ summary, results });
   } catch (e) {
@@ -381,56 +382,48 @@ app.put("/songs/:id", async (req, res) => {
   return res.json({ message: "Song updated" });
 });
 
-// PAGINATED: avoid the ~1000 row cap
-app.get("/songs", async (req, res) => {
-  const {
-    name,
-    created_by,
-    last_updated_by,
-    created_from,
-    created_to,
-    updated_from,
-    updated_to,
-    limit,
-    offset,
-  } = req.query;
+/* 🔄 CHANGED: GET /songs
+   - No query params required
+   - Returns ALL songs in one call as a plain array
+   - Internally pages Supabase in 1000-row chunks
+*/
+app.get("/songs", async (_req, res) => {
+  const CHUNK = 1000; // Supabase per-request cap
+  let offset = 0;
+  const rows = [];
 
-  const pageSize = Math.min(parseInt(limit ?? "1000"), 5000);
-  const pageOffset = Math.max(parseInt(offset ?? "0"), 0);
+  try {
+    while (true) {
+      const { data, error } = await supabase
+        .from("songs")
+        .select("*")
+        .order("song_id", { ascending: true })
+        .range(offset, offset + CHUNK - 1);
 
-  let query = supabase.from("songs").select("*", { count: "exact" });
+      if (error) return jsonError(res, 500, error.message);
+      if (!data || data.length === 0) break;
 
-  if (name) query = query.ilike("song_name", `%${name}%`);
-  if (created_by) query = query.eq("created_by", created_by);
-  if (last_updated_by) query = query.eq("last_updated_by", last_updated_by);
-  if (created_from) query = query.gte("created_at", created_from);
-  if (created_to) query = query.lte("created_at", created_to);
-  if (updated_from) query = query.gte("last_updated_at", updated_from);
-  if (updated_to) query = query.lte("last_updated_at", updated_to);
+      rows.push(...data);
+      if (data.length < CHUNK) break; // last page
+      offset += CHUNK;
+    }
 
-  const { data, error, count } = await query
-    .range(pageOffset, pageOffset + pageSize - 1)
-    .order("song_id", { ascending: true });
+    const mapped = rows.map((row) => ({
+      song_id: row.song_id,
+      song_name: row.song_name,
+      main_stanza: row.main_stanza,
+      stanzas: row.stanzas,
+      created_at: row.created_at,
+      last_updated_at: row.last_updated_at,
+      created_by: row.created_by,
+      last_updated_by: row.last_updated_by,
+    }));
 
-  if (sbAssert(res, error) !== true) return;
-
-  const mapped = (data || []).map((row) => ({
-    song_id: row.song_id,
-    song_name: row.song_name,
-    main_stanza: row.main_stanza,
-    stanzas: row.stanzas,
-    created_at: row.created_at,
-    last_updated_at: row.last_updated_at,
-    created_by: row.created_by,
-    last_updated_by: row.last_updated_by,
-  }));
-
-  return res.json({
-    total: count ?? mapped.length,
-    limit: pageSize,
-    offset: pageOffset,
-    data: mapped,
-  });
+    return res.json(mapped); // ✅ plain array
+  } catch (e) {
+    console.error("GET /songs error:", e);
+    return jsonError(res, 500, e.message || "Failed to fetch songs");
+  }
 });
 
 app.get("/songs/:id", async (req, res) => {
