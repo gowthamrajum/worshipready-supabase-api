@@ -12,7 +12,6 @@ const app = express();
 // ---------- Supabase ----------
 const supabase = createClient(
   process.env.SUPABASE_URL,
-  // Use SERVICE_ROLE so this backend can bypass RLS safely.
   process.env.SUPABASE_SERVICE_ROLE_KEY,
   { auth: { persistSession: false } }
 );
@@ -41,12 +40,15 @@ app.options("*", cors());
 app.use(bodyParser.json({ limit: "50mb" }));
 app.use((req, res, next) => (req.method === "OPTIONS" ? res.sendStatus(204) : next()));
 
-// Small helper to standardize Supabase error responses
+// ---------- Helpers ----------
+function jsonError(res, status, message, extra = {}) {
+  return res.status(status).json({ error: message, ...extra });
+}
+
 function sbAssert(res, err) {
   if (err) {
     console.error("Supabase error:", err);
-    res.status(500).send(err.message || "Database error");
-    return false;
+    return jsonError(res, 500, err.message || "Database error");
   }
   return true;
 }
@@ -57,145 +59,15 @@ function sbAssert(res, err) {
 app.post("/presentations", async (req, res) => {
   const { presentationName, createdDateTime } = req.body;
   if (!presentationName || !createdDateTime)
-    return res.status(400).send("presentationName and createdDateTime required.");
-  // We don't actually persist anything here (to match your existing behavior)
-  res.status(201).send("Presentation initialized.");
-});
-
-app.post("/songs/bulk", async (req, res) => {
-  try {
-    // Accept either array body or { songs: [...] }
-    const payload = Array.isArray(req.body) ? req.body : req.body?.songs;
-    if (!Array.isArray(payload) || payload.length === 0) {
-      return res.status(400).json({ error: "Body must be a non-empty array or { songs: [...] }" });
-    }
-
-    // Pull existing names once for similarity checks
-    const { data: existing, error: fetchErr } = await supabase
-      .from("songs")
-      .select("song_id, song_name");
-    if (fetchErr) return res.status(500).send(fetchErr.message);
-
-    const existingNames = (existing || []).map(s => s.song_name);
-    const acceptedNames = []; // names we will insert in this batch (to avoid dup inside payload)
-
-    // helpers
-    const asObj = (v) => (typeof v === "string" ? JSON.parse(v) : v);
-    const isValid = (s) =>
-      s &&
-      (s.song_name || s.songName) &&
-      (s.main_stanza || s.mainStanza) &&
-      (s.stanzas);
-
-    const results = [];
-    const toInsert = [];
-
-    for (let i = 0; i < payload.length; i++) {
-      const raw = payload[i];
-
-      // Map common aliases from your file to DB fields
-      const song_name = raw.song_name || raw.songName;
-      const main_stanza = raw.main_stanza ?? raw.mainStanza;
-      const stanzas = raw.stanzas;
-
-      if (!isValid({ song_name, main_stanza, stanzas })) {
-        results.push({ index: i, song_name, status: "invalid", reason: "Missing fields" });
-        continue;
-      }
-
-      // Similarity checks against DB
-      const conflictExisting = existingNames.some((n) =>
-        stringSimilarity.compareTwoStrings(song_name, n) >= 0.8
-      );
-
-      // …and within the current payload we’re accepting this run
-      const conflictInPayload = acceptedNames.some((n) =>
-        stringSimilarity.compareTwoStrings(song_name, n) >= 0.8
-      );
-
-      if (conflictExisting || conflictInPayload) {
-        results.push({
-          index: i,
-          song_name,
-          status: "skipped_conflict",
-          conflictWith: conflictExisting ? "database" : "payload",
-        });
-        continue;
-      }
-
-      // Build row; keep meta when present
-      const row = {
-        song_name,
-        main_stanza: asObj(main_stanza),
-        stanzas: asObj(stanzas),
-        created_at: raw.created_at || new Date().toISOString(),
-        last_updated_at: raw.last_updated_at || new Date().toISOString(),
-        created_by: raw.created_by || "System",
-        last_updated_by: raw.last_updated_by || "",
-      };
-
-      toInsert.push({ index: i, row });
-      acceptedNames.push(song_name);
-    }
-
-    // Insert in one or a few batches (keeps it simple)
-    const BATCH = 500;
-    let createdCount = 0;
-
-    for (let off = 0; off < toInsert.length; off += BATCH) {
-      const chunk = toInsert.slice(off, off + BATCH);
-      const { data, error } = await supabase
-        .from("songs")
-        .insert(chunk.map(c => c.row))
-        .select("song_id, song_name");
-
-      if (error) {
-        // mark every row in this chunk as failed
-        chunk.forEach(c => {
-          results.push({ index: c.index, song_name: c.row.song_name, status: "failed", reason: error.message });
-        });
-      } else {
-        createdCount += data.length;
-        // mark created rows
-        // Note: order from PostgREST is typically input order for simple inserts
-        for (let k = 0; k < data.length; k++) {
-          const c = chunk[k];
-          const d = data[k];
-          results.push({
-            index: c.index,
-            song_name: d.song_name,
-            status: "created",
-            song_id: d.song_id,
-          });
-        }
-      }
-    }
-
-    // Also make sure any invalid/skipped rows that were pushed earlier are present.
-    // (They already are; created rows appended above.)
-
-    // Sort results back to original order by index for convenience
-    results.sort((a, b) => a.index - b.index);
-
-    const summary = {
-      requested: payload.length,
-      created: createdCount,
-      skipped_conflict: results.filter(r => r.status === "skipped_conflict").length,
-      invalid: results.filter(r => r.status === "invalid").length,
-      failed: results.filter(r => r.status === "failed").length,
-    };
-
-    res.status(createdCount > 0 ? 201 : 200).json({ summary, results });
-  } catch (e) {
-    console.error("bulk songs error:", e);
-    res.status(500).json({ error: e.message || "Bulk insert failed" });
-  }
+    return jsonError(res, 400, "presentationName and createdDateTime required.");
+  // parity with original behavior: no DB write here
+  return res.status(201).json({ message: "Presentation initialized." });
 });
 
 app.post("/presentations/slide", async (req, res) => {
   const { presentationName, slideOrder, slideData, randomId } = req.body;
   if (!presentationName || !slideData || !randomId)
-    return res.status(400).send("presentationName, randomId and slideData are required.");
+    return jsonError(res, 400, "presentationName, randomId and slideData are required.");
 
   const now = new Date().toISOString();
 
@@ -210,21 +82,20 @@ app.post("/presentations/slide", async (req, res) => {
     },
   ]);
 
-  if (!sbAssert(res, error)) return;
-  res.status(201).send("Slide added.");
+  if (sbAssert(res, error) !== true) return;
+  return res.status(201).json({ message: "Slide added." });
 });
 
 app.get("/presentations/older", async (req, res) => {
   const hours = parseInt(req.query.hours) || 48;
   const thresholdDate = new Date(Date.now() - hours * 60 * 60 * 1000).toISOString();
 
-  // Fetch all older rows, then group in Node (PostgREST doesn't do GROUP BY directly)
   const { data, error } = await supabase
     .from("presentations")
     .select("presentation_name, created_datetime")
     .lt("created_datetime", thresholdDate);
 
-  if (!sbAssert(res, error)) return;
+  if (sbAssert(res, error) !== true) return;
 
   const grouped = {};
   for (const row of data || []) {
@@ -239,13 +110,13 @@ app.get("/presentations/older", async (req, res) => {
     .map(([presentationName, createdDateTime]) => ({ presentationName, createdDateTime }))
     .sort((a, b) => new Date(b.createdDateTime) - new Date(a.createdDateTime));
 
-  res.json(result);
+  return res.json(result);
 });
 
 app.put("/presentations/slide", async (req, res) => {
   const { presentationName, randomId, slideData } = req.body;
   if (!presentationName || !randomId || !slideData)
-    return res.status(400).send("presentationName, randomId and slideData are required.");
+    return jsonError(res, 400, "presentationName, randomId and slideData are required.");
 
   const now = new Date().toISOString();
   const { data, error } = await supabase
@@ -256,11 +127,11 @@ app.put("/presentations/slide", async (req, res) => {
     })
     .eq("presentation_name", presentationName)
     .eq("random_id", randomId)
-    .select("id"); // so we can see if any row changed
+    .select("id");
 
-  if (!sbAssert(res, error)) return;
-  if (!data || data.length === 0) return res.status(404).send("Slide not found.");
-  res.send("Slide updated.");
+  if (sbAssert(res, error) !== true) return;
+  if (!data || data.length === 0) return jsonError(res, 404, "Slide not found.");
+  return res.json({ message: "Slide updated." });
 });
 
 app.get("/presentations/:name/slides", async (req, res) => {
@@ -270,10 +141,9 @@ app.get("/presentations/:name/slides", async (req, res) => {
     .eq("presentation_name", req.params.name)
     .order("created_datetime", { ascending: true });
 
-  if (!sbAssert(res, error)) return;
+  if (sbAssert(res, error) !== true) return;
 
-  // Keep API shape close to original (slide_data as is; created_datetime already ISO)
-  res.json(
+  return res.json(
     (data || []).map((r) => ({
       randomId: r.random_id,
       slideData: r.slide_data,
@@ -288,11 +158,12 @@ app.delete("/presentations/slide/:presentationName/:randomId", async (req, res) 
     .from("presentations")
     .delete()
     .eq("presentation_name", presentationName)
-    .eq("random_id", randomId);
+    .eq("random_id", randomId)
+    .select("id");
 
-  if (!sbAssert(res, error)) return;
-  if (!data || data.length === 0) return res.status(404).send("Slide not found.");
-  res.send(`Slide with ID "${randomId}" deleted.`);
+  if (sbAssert(res, error) !== true) return;
+  if (!data || data.length === 0) return jsonError(res, 404, "Slide not found.");
+  return res.json({ message: `Slide with ID "${randomId}" deleted.` });
 });
 
 app.get("/presentations", async (req, res) => {
@@ -300,10 +171,10 @@ app.get("/presentations", async (req, res) => {
     .from("presentations")
     .select("presentation_name, created_datetime");
 
-  if (!sbAssert(res, error)) return;
+  if (sbAssert(res, error) !== true) return;
 
   const set = new Set((data || []).map((r) => r.presentation_name));
-  res.json([...set].sort((a, b) => a.localeCompare(b)));
+  return res.json([...set].sort((a, b) => a.localeCompare(b)));
 });
 
 app.delete("/presentations/:presentationName", async (req, res) => {
@@ -314,31 +185,160 @@ app.delete("/presentations/:presentationName", async (req, res) => {
     .eq("presentation_name", presentationName)
     .select("id");
 
-  if (!sbAssert(res, error)) return;
+  if (sbAssert(res, error) !== true) return;
   if (!data || data.length === 0)
-    return res.status(404).send("No presentation found with that name.");
-  res.send(`Deleted ${data.length} slide(s) from presentation "${presentationName}".`);
+    return jsonError(res, 404, "No presentation found with that name.");
+  return res.json({
+    message: `Deleted ${data.length} slide(s) from presentation "${presentationName}".`,
+  });
 });
 
 // -------------------------------
-// ✅ Songs API
-// -------------------------------
+/* ✅ Songs API
+   Bulk endpoint defaults to NO similarity (imports everything).
+   You can toggle with:
+   - allowSimilar=true  (default)  -> no similarity checks (import all)
+   - allowSimilar=false & similarity=0.8 (or 0..1) to enable checks
+*/
+app.post("/songs/bulk", async (req, res) => {
+  try {
+    const payload = Array.isArray(req.body) ? req.body : req.body?.songs;
+    if (!Array.isArray(payload) || payload.length === 0) {
+      return jsonError(res, 400, "Body must be a non-empty array or { songs: [...] }");
+    }
+
+    const { data: existing, error: fetchErr } = await supabase
+      .from("songs")
+      .select("song_id, song_name");
+    if (fetchErr) return sbAssert(res, fetchErr);
+
+    const existingNames = (existing || []).map((s) => s.song_name);
+    const acceptedNames = [];
+
+    const asObj = (v) => (typeof v === "string" ? JSON.parse(v) : v);
+
+    // Controls — defaults import everything (no similarity)
+    const allowSimilar = (req.query.allowSimilar ?? "true") === "true"; // default true
+    const similarity = Math.max(0, Math.min(1, parseFloat(req.query.similarity ?? "0.8")));
+
+    const results = [];
+    const toInsert = [];
+
+    for (let i = 0; i < payload.length; i++) {
+      const raw = payload[i];
+      const song_name = raw.song_name || raw.songName;
+      const main_stanza = raw.main_stanza ?? raw.mainStanza;
+      const stanzas = raw.stanzas;
+
+      if (!song_name || !main_stanza || !stanzas) {
+        results.push({ index: i, song_name, status: "invalid", reason: "Missing fields" });
+        continue;
+      }
+
+      let blockedBySimilarity = false;
+      if (!allowSimilar) {
+        const conflictExisting = existingNames.some(
+          (n) => stringSimilarity.compareTwoStrings(song_name, n) >= similarity
+        );
+        const conflictInPayload = acceptedNames.some(
+          (n) => stringSimilarity.compareTwoStrings(song_name, n) >= similarity
+        );
+        blockedBySimilarity = conflictExisting || conflictInPayload;
+      }
+
+      if (blockedBySimilarity) {
+        results.push({
+          index: i,
+          song_name,
+          status: "skipped_conflict",
+          conflictWith: "similarity",
+          similarityThreshold: similarity,
+        });
+        continue;
+      }
+
+      const row = {
+        song_name,
+        main_stanza: asObj(main_stanza),
+        stanzas: asObj(stanzas),
+        created_at: raw.created_at || new Date().toISOString(),
+        last_updated_at: raw.last_updated_at || new Date().toISOString(),
+        created_by: raw.created_by || "System",
+        last_updated_by: raw.last_updated_by || "",
+      };
+
+      toInsert.push({ index: i, row });
+      acceptedNames.push(song_name);
+    }
+
+    const BATCH = 500;
+    let createdCount = 0;
+
+    for (let off = 0; off < toInsert.length; off += BATCH) {
+      const chunk = toInsert.slice(off, off + BATCH);
+      const { data, error } = await supabase
+        .from("songs")
+        .insert(chunk.map((c) => c.row))
+        .select("song_id, song_name");
+
+      if (error) {
+        chunk.forEach((c) => {
+          results.push({
+            index: c.index,
+            song_name: c.row.song_name,
+            status: "failed",
+            reason: error.message,
+          });
+        });
+      } else {
+        createdCount += data.length;
+        for (let k = 0; k < data.length; k++) {
+          const c = chunk[k];
+          const d = data[k];
+          results.push({
+            index: c.index,
+            song_name: d.song_name,
+            status: "created",
+            song_id: d.song_id,
+          });
+        }
+      }
+    }
+
+    results.sort((a, b) => a.index - b.index);
+
+    const summary = {
+      requested: payload.length,
+      created: createdCount,
+      skipped_conflict: results.filter((r) => r.status === "skipped_conflict").length,
+      invalid: results.filter((r) => r.status === "invalid").length,
+      failed: results.filter((r) => r.status === "failed").length,
+    };
+
+    // If anything failed/invalid/skipped, still return 201 if some created; otherwise 200.
+    const status = createdCount > 0 ? 201 : 200;
+    return res.status(status).json({ summary, results });
+  } catch (e) {
+    console.error("bulk songs error:", e);
+    return jsonError(res, 500, e.message || "Bulk insert failed");
+  }
+});
+
 app.post("/songs", async (req, res) => {
   const { song_name, main_stanza, stanzas } = req.body;
   if (!song_name || !main_stanza || !stanzas)
-    return res.status(400).send("Missing required fields");
+    return jsonError(res, 400, "Missing required fields");
 
-  // Similarity check (pull names and compare)
+  // Keep similarity check for single insert (can adjust if desired)
   const { data: allSongs, error: fetchErr } = await supabase
     .from("songs")
     .select("song_id, song_name");
-
-  if (!sbAssert(res, fetchErr)) return;
+  if (sbAssert(res, fetchErr) !== true) return;
 
   const conflict = (allSongs || []).find(
     (song) => stringSimilarity.compareTwoStrings(song_name, song.song_name) >= 0.8
   );
-  if (conflict) return res.status(409).send("A similar song already exists");
+  if (conflict) return jsonError(res, 409, "A similar song already exists");
 
   const now = new Date().toISOString();
   const { data, error } = await supabase
@@ -357,8 +357,8 @@ app.post("/songs", async (req, res) => {
     .select("song_id")
     .single();
 
-  if (!sbAssert(res, error)) return;
-  res.json({ song_id: data.song_id });
+  if (sbAssert(res, error) !== true) return;
+  return res.status(201).json({ song_id: data.song_id });
 });
 
 app.put("/songs/:id", async (req, res) => {
@@ -372,16 +372,16 @@ app.put("/songs/:id", async (req, res) => {
       main_stanza: typeof main_stanza === "string" ? JSON.parse(main_stanza) : main_stanza,
       stanzas: typeof stanzas === "string" ? JSON.parse(stanzas) : stanzas,
       last_updated_by: updatedBy,
-      // last_updated_at is auto-bumped by trigger
     })
     .eq("song_id", req.params.id)
     .select("song_id");
 
-  if (!sbAssert(res, error)) return;
-  if (!data || data.length === 0) return res.status(404).send("Song not found");
-  res.send("Song updated");
+  if (sbAssert(res, error) !== true) return;
+  if (!data || data.length === 0) return jsonError(res, 404, "Song not found");
+  return res.json({ message: "Song updated" });
 });
 
+// PAGINATED: avoid the ~1000 row cap
 app.get("/songs", async (req, res) => {
   const {
     name,
@@ -391,9 +391,14 @@ app.get("/songs", async (req, res) => {
     created_to,
     updated_from,
     updated_to,
+    limit,
+    offset,
   } = req.query;
 
-  let query = supabase.from("songs").select("*");
+  const pageSize = Math.min(parseInt(limit ?? "1000"), 5000);
+  const pageOffset = Math.max(parseInt(offset ?? "0"), 0);
+
+  let query = supabase.from("songs").select("*", { count: "exact" });
 
   if (name) query = query.ilike("song_name", `%${name}%`);
   if (created_by) query = query.eq("created_by", created_by);
@@ -403,13 +408,16 @@ app.get("/songs", async (req, res) => {
   if (updated_from) query = query.gte("last_updated_at", updated_from);
   if (updated_to) query = query.lte("last_updated_at", updated_to);
 
-  const { data, error } = await query;
-  if (!sbAssert(res, error)) return;
+  const { data, error, count } = await query
+    .range(pageOffset, pageOffset + pageSize - 1)
+    .order("song_id", { ascending: true });
+
+  if (sbAssert(res, error) !== true) return;
 
   const mapped = (data || []).map((row) => ({
     song_id: row.song_id,
     song_name: row.song_name,
-    main_stanza: row.main_stanza, // already JSON
+    main_stanza: row.main_stanza,
     stanzas: row.stanzas,
     created_at: row.created_at,
     last_updated_at: row.last_updated_at,
@@ -417,7 +425,12 @@ app.get("/songs", async (req, res) => {
     last_updated_by: row.last_updated_by,
   }));
 
-  res.json(mapped);
+  return res.json({
+    total: count ?? mapped.length,
+    limit: pageSize,
+    offset: pageOffset,
+    data: mapped,
+  });
 });
 
 app.get("/songs/:id", async (req, res) => {
@@ -427,11 +440,10 @@ app.get("/songs/:id", async (req, res) => {
     .eq("song_id", req.params.id)
     .single();
 
-  if (error && error.code === "PGRST116") // not found
-    return res.status(404).send("Song not found");
-  if (!sbAssert(res, error)) return;
+  if (error && error.code === "PGRST116") return jsonError(res, 404, "Song not found");
+  if (sbAssert(res, error) !== true) return;
 
-  res.json({
+  return res.json({
     song_id: data.song_id,
     song_name: data.song_name,
     main_stanza: data.main_stanza,
@@ -450,9 +462,9 @@ app.delete("/songs/:id", async (req, res) => {
     .eq("song_id", req.params.id)
     .select("song_id");
 
-  if (!sbAssert(res, error)) return;
-  if (!data || data.length === 0) return res.status(404).send("Song not found.");
-  res.send("Song deleted successfully.");
+  if (sbAssert(res, error) !== true) return;
+  if (!data || data.length === 0) return jsonError(res, 404, "Song not found.");
+  return res.json({ message: "Song deleted successfully." });
 });
 
 app.delete("/songs/by-name/:name", async (req, res) => {
@@ -460,12 +472,12 @@ app.delete("/songs/by-name/:name", async (req, res) => {
   const { data, error } = await supabase
     .from("songs")
     .delete()
-    .filter("song_name", "ilike", name) // exact match case-insensitive
+    .filter("song_name", "ilike", name) // exact match, case-insensitive
     .select("song_id");
 
-  if (!sbAssert(res, error)) return;
-  if (!data || data.length === 0) return res.status(404).send("No song found with that name.");
-  res.send("Song(s) deleted successfully.");
+  if (sbAssert(res, error) !== true) return;
+  if (!data || data.length === 0) return jsonError(res, 404, "No song found with that name.");
+  return res.json({ message: "Song(s) deleted successfully." });
 });
 
 // -------------------------------
@@ -474,7 +486,7 @@ app.delete("/songs/by-name/:name", async (req, res) => {
 app.post("/psalms", async (req, res) => {
   const { chapter, verse, telugu, english } = req.body;
   if (!chapter || !verse || !telugu || !english)
-    return res.status(400).send("All fields are required.");
+    return jsonError(res, 400, "All fields are required.");
 
   const { data, error } = await supabase
     .from("psalms")
@@ -482,8 +494,8 @@ app.post("/psalms", async (req, res) => {
     .select("id")
     .single();
 
-  if (!sbAssert(res, error)) return;
-  res.send({ id: data.id });
+  if (sbAssert(res, error) !== true) return;
+  return res.status(201).json({ id: data.id });
 });
 
 app.get("/psalms/:chapter/range", async (req, res) => {
@@ -496,8 +508,8 @@ app.get("/psalms/:chapter/range", async (req, res) => {
     .lte("verse", end)
     .order("verse", { ascending: true });
 
-  if (!sbAssert(res, error)) return;
-  res.json(data || []);
+  if (sbAssert(res, error) !== true) return;
+  return res.json(data || []);
 });
 
 app.get("/psalms/:chapter/:verse", async (req, res) => {
@@ -509,9 +521,9 @@ app.get("/psalms/:chapter/:verse", async (req, res) => {
     .single();
 
   if (error && error.code === "PGRST116")
-    return res.status(404).send("Verse not found.");
-  if (!sbAssert(res, error)) return;
-  res.json(data);
+    return jsonError(res, 404, "Verse not found.");
+  if (sbAssert(res, error) !== true) return;
+  return res.json(data);
 });
 
 app.get("/psalms/:chapter", async (req, res) => {
@@ -521,8 +533,8 @@ app.get("/psalms/:chapter", async (req, res) => {
     .eq("chapter", req.params.chapter)
     .order("verse", { ascending: true });
 
-  if (!sbAssert(res, error)) return;
-  res.json(data || []);
+  if (sbAssert(res, error) !== true) return;
+  return res.json(data || []);
 });
 
 app.put("/psalms/:id", async (req, res) => {
@@ -533,9 +545,9 @@ app.put("/psalms/:id", async (req, res) => {
     .eq("id", req.params.id)
     .select("id");
 
-  if (!sbAssert(res, error)) return;
-  if (!data || data.length === 0) return res.status(404).send("Psalm not found.");
-  res.send("Psalm updated.");
+  if (sbAssert(res, error) !== true) return;
+  if (!data || data.length === 0) return jsonError(res, 404, "Psalm not found.");
+  return res.json({ message: "Psalm updated." });
 });
 
 app.delete("/psalms/:id", async (req, res) => {
@@ -545,23 +557,23 @@ app.delete("/psalms/:id", async (req, res) => {
     .eq("id", req.params.id)
     .select("id");
 
-  if (!sbAssert(res, error)) return;
-  if (!data || data.length === 0) return res.status(404).send("Psalm not found.");
-  res.send("Psalm deleted successfully.");
+  if (sbAssert(res, error) !== true) return;
+  if (!data || data.length === 0) return jsonError(res, 404, "Psalm not found.");
+  return res.json({ message: "Psalm deleted successfully." });
 });
 
 app.post("/psalms/bulk", async (req, res) => {
   const verses = req.body;
   if (!Array.isArray(verses) || verses.length === 0)
-    return res.status(400).send("Must be a non-empty array of verses.");
+    return jsonError(res, 400, "Must be a non-empty array of verses.");
 
   const rows = verses
-    .filter(v => v && v.chapter && v.verse && v.telugu && v.english)
+    .filter((v) => v && v.chapter && v.verse && v.telugu && v.english)
     .map(({ chapter, verse, telugu, english }) => ({ chapter, verse, telugu, english }));
 
   const { error } = await supabase.from("psalms").insert(rows);
-  if (!sbAssert(res, error)) return;
-  res.send("Psalms inserted successfully.");
+  if (sbAssert(res, error) !== true) return;
+  return res.status(201).json({ message: "Psalms inserted successfully.", inserted: rows.length });
 });
 
 // -------------------------------
@@ -583,10 +595,10 @@ async function deleteOldPresentationsCompletely() {
     .lt("created_datetime", twoDaysAgoISO);
 
   if (error) {
-    return console.error("❌ Error querying old presentation groups:", error.message);
+    console.error("❌ Error querying old presentation groups:", error.message);
+    return;
   }
 
-  // group by name, keep max(created_datetime)
   const groups = new Map();
   for (const r of data || []) {
     const k = r.presentation_name;
@@ -605,16 +617,16 @@ async function deleteOldPresentationsCompletely() {
     return;
   }
 
-  const { data: delData, error: delErr } = await supabase
+  const del = await supabase
     .from("presentations")
     .delete()
     .in("presentation_name", staleNames)
     .select("id");
 
-  if (delErr) {
-    console.error("❌ Deletion error:", delErr.message);
+  if (del.error) {
+    console.error("❌ Deletion error:", del.error.message);
   } else {
-    console.log(`🧹 Deleted ${delData?.length || 0} slide(s) from presentations:`, staleNames);
+    console.log(`🧹 Deleted ${del.data?.length || 0} slide(s) from presentations:`, staleNames);
   }
 }
 
@@ -629,7 +641,7 @@ function scheduleRandomCleanup() {
   console.log(`⏰ Next cleanup scheduled at ${nextRun.toLocaleString()}`);
   setTimeout(async () => {
     await deleteOldPresentationsCompletely();
-    scheduleRandomCleanup(); // reschedule next cleanup
+    scheduleRandomCleanup();
   }, delay);
 }
 
