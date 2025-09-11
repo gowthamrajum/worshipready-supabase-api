@@ -18,29 +18,42 @@ const supabase = createClient(
 );
 
 // ---------- Middlewares ----------
-app.use(
-  cors({
-    origin: function (origin, callback) {
-      const allowedOrigins = [
-        "https://worshipready.onrender.com",
-        "https://grey-gratis-ice.onrender.com",
-      ];
-      if (!origin || allowedOrigins.includes(origin)) {
-        callback(null, true);
-      } else {
-        console.warn("❌ CORS blocked:", origin);
-        callback(new Error("Not allowed by CORS"));
-      }
-    },
-    methods: ["GET", "POST", "PUT", "DELETE", "OPTIONS"],
-    allowedHeaders: ["Content-Type", "Authorization"],
-    credentials: false,
-  })
-);
-app.options("*", cors());
+const allowedOrigins = [
+  "https://worshipready.onrender.com",
+  "https://grey-gratis-ice.onrender.com",
+  "http://localhost:5173",
+  "http://127.0.0.1:5173",
+];
+
+function isAllowedOrigin(origin) {
+  if (!origin) return true; // allow curl/server-to-server
+  try {
+    const o = new URL(origin);
+    const normalized = `${o.protocol}//${o.hostname}${o.port ? `:${o.port}` : ""}`;
+    return allowedOrigins.includes(normalized);
+  } catch {
+    return false;
+  }
+}
+
+const corsOptions = {
+  origin(origin, callback) {
+    if (isAllowedOrigin(origin)) return callback(null, true);
+    console.warn("❌ CORS blocked:", origin);
+    return callback(new Error("Not allowed by CORS"));
+  },
+  methods: ["GET", "POST", "PUT", "DELETE", "OPTIONS"],
+  allowedHeaders: ["Content-Type", "Authorization"],
+  credentials: false,             // set true only if you use cookies
+  preflightContinue: false,
+  optionsSuccessStatus: 204,
+};
+
+app.use(cors(corsOptions));
+app.options("*", cors(corsOptions)); // handle preflights with same options
 app.use(bodyParser.json({ limit: "50mb" }));
-app.use((req, res, next) => (req.method === "OPTIONS" ? res.sendStatus(204) : next()));
-app.use(compression()); // ✅ enable gzip
+// ❌ Remove this line (it strips CORS headers on OPTIONS):
+// app.use((req, res, next) => (req.method === "OPTIONS" ? res.sendStatus(204) : next()));
 
 // ---------- Helpers ----------
 function jsonError(res, status, message, extra = {}) {
